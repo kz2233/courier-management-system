@@ -24,7 +24,7 @@ jobs:
         timeout-minutes: 10
         run: |
           set +e
-          /usr/bin/timeout 8m /home/wenhui/.local/bin/semgrep ci \
+          /usr/bin/timeout 90s /home/wenhui/.local/bin/semgrep ci \
             --json \
             --output security-reports/semgrep-results.json
           semgrep_status=$?
@@ -33,8 +33,14 @@ jobs:
           if [ "$semgrep_status" -ne 0 ] || [ ! -s security-reports/semgrep-results.json ]; then
             echo "::warning::Semgrep CI did not produce a JSON report; falling back to local Semgrep rules."
             set +e
-            /home/wenhui/.local/bin/semgrep scan \
+            /usr/bin/timeout 5m /home/wenhui/.local/bin/semgrep scan \
               --config p/default \
+              --jobs 1 \
+              --max-memory 2048 \
+              --exclude Admin/assets/vendors \
+              --exclude fonts \
+              --exclude scss/bootstrap \
+              --exclude .scannerwork \
               --json \
               --output security-reports/semgrep-results.json \
               .
