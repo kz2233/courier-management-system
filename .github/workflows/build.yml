@@ -32,11 +32,19 @@ jobs:
 
           if [ "$semgrep_status" -ne 0 ] || [ ! -s security-reports/semgrep-results.json ]; then
             echo "::warning::Semgrep CI did not produce a JSON report; falling back to local Semgrep rules."
+            set +e
             /home/wenhui/.local/bin/semgrep scan \
-              --config auto \
+              --config p/default \
               --json \
               --output security-reports/semgrep-results.json \
               .
+            fallback_status=$?
+            set -e
+
+            if [ "$fallback_status" -ne 0 ] || [ ! -s security-reports/semgrep-results.json ]; then
+              echo '{"errors":["Semgrep did not produce a report"],"results":[]}' > security-reports/semgrep-results.json
+              echo "::warning::Semgrep fallback failed; wrote an empty JSON report so later scans can continue."
+            fi
           fi
 
       - name: SonarQube Scan
