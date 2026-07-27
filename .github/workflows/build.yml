@@ -21,10 +21,23 @@ jobs:
 
       - name: Semgrep Scan
         continue-on-error: true
+        timeout-minutes: 10
         run: |
-          /home/wenhui/.local/bin/semgrep ci \
+          set +e
+          /usr/bin/timeout 8m /home/wenhui/.local/bin/semgrep ci \
             --json \
             --output security-reports/semgrep-results.json
+          semgrep_status=$?
+          set -e
+
+          if [ "$semgrep_status" -ne 0 ] || [ ! -s security-reports/semgrep-results.json ]; then
+            echo "::warning::Semgrep CI did not produce a JSON report; falling back to local Semgrep rules."
+            /home/wenhui/.local/bin/semgrep scan \
+              --config auto \
+              --json \
+              --output security-reports/semgrep-results.json \
+              .
+          fi
 
       - name: SonarQube Scan
         uses: SonarSource/sonarqube-scan-action@v7
