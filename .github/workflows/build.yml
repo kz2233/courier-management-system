@@ -16,8 +16,37 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Prepare security report directory
+        run: mkdir -p security-reports
+
+      - name: Semgrep Scan
+        continue-on-error: true
+        run: |
+          /home/wenhui/.local/bin/semgrep ci \
+            --json \
+            --output security-reports/semgrep-results.json
+
       - name: SonarQube Scan
         uses: SonarSource/sonarqube-scan-action@v7
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           SONAR_HOST_URL: http://localhost:9000
+
+      - name: OWASP ZAP Baseline Scan
+        continue-on-error: true
+        run: |
+          docker run --rm --network host \
+            -v "${{ github.workspace }}/security-reports:/zap/wrk" \
+            zaproxy/zap-stable \
+            zap-baseline.py \
+            -t http://127.0.0.1:8082 \
+            -J zap-baseline.json \
+            -r zap-baseline.html \
+            -w zap-baseline.md
+
+      - name: Upload security reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-reports
+          path: security-reports/
