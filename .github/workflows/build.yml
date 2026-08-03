@@ -1,3 +1,6 @@
+Failed to create stream fd: Operation not permitted
+Failed to create stream fd: Operation not permitted
+Failed to create stream fd: Operation not permitted
 name: Build
 
 on:
@@ -23,8 +26,16 @@ jobs:
         continue-on-error: true
         timeout-minutes: 10
         run: |
+          export PATH="${HOME}/.local/bin:${PATH}"
+          semgrep_bin="$(command -v semgrep || true)"
+          if [ -z "$semgrep_bin" ]; then
+            echo '::warning::Semgrep is not installed or not available on PATH.'
+            printf '%s\n' '{"errors":["Semgrep executable not found on PATH"],"results":[]}' > security-reports/semgrep-results.json
+            exit 0
+          fi
+
           set +e
-          /usr/bin/timeout 90s /home/wenhui/.local/bin/semgrep ci \
+          /usr/bin/timeout 90s "$semgrep_bin" ci \
             --json \
             --output security-reports/semgrep-results.json
           semgrep_status=$?
@@ -33,7 +44,7 @@ jobs:
           if [ "$semgrep_status" -ne 0 ] || [ ! -s security-reports/semgrep-results.json ]; then
             echo "::warning::Semgrep CI did not produce a JSON report; falling back to local Semgrep rules."
             set +e
-            /usr/bin/timeout 5m /home/wenhui/.local/bin/semgrep scan \
+            /usr/bin/timeout 5m "$semgrep_bin" scan \
               --config p/default \
               --jobs 1 \
               --max-memory 2048 \
@@ -77,3 +88,47 @@ jobs:
         with:
           name: security-reports
           path: security-reports/
+
+      - name: Verify Confluence tracking page access
+        if: always()
+        env:
+          CONFLUENCE_BASE_URL: https://lukaazhun.atlassian.net
+          CONFLUENCE_PAGE_ID: "65975"
+          CONFLUENCE_EMAIL: ${{ secrets.CONFLUENCE_EMAIL }}
+          CONFLUENCE_API_TOKEN: ${{ secrets.CONFLUENCE_API_TOKEN }}
+        run: |
+          python3 - <<'PY'
+          import base64
+          import json
+          import os
+          import urllib.error
+          import urllib.request
+
+          base_url = os.environ["CONFLUENCE_BASE_URL"].rstrip("/")
+          page_id = os.environ["CONFLUENCE_PAGE_ID"]
+          email = os.environ.get("CONFLUENCE_EMAIL", "")
+          token = os.environ.get("CONFLUENCE_API_TOKEN", "")
+
+          if not email or not token:
+              raise SystemExit("Confluence credentials are not available to this job")
+
+          credentials = base64.b64encode(f"{email}:{token}".encode()).decode()
+          request = urllib.request.Request(
+              f"{base_url}/wiki/rest/api/content/{page_id}?expand=version",
+              headers={
+                  "Accept": "application/json",
+                  "Authorization": f"Basic {credentials}",
+              },
+          )
+
+          try:
+              with urllib.request.urlopen(request, timeout=20) as response:
+                  page = json.load(response)
+          except urllib.error.HTTPError as error:
+              raise SystemExit(f"Confluence page check failed with HTTP {error.code}") from error
+          except urllib.error.URLError as error:
+              raise SystemExit(f"Confluence page check failed: {error.reason}") from error
+
+          version = page.get("version", {}).get("number", "unknown")
+          print(f"Confluence access verified for page {page_id}; current version {version}.")
+          PY
