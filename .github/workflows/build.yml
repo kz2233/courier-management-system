@@ -44,7 +44,7 @@ jobs:
             /usr/bin/timeout 5m "$semgrep_bin" scan \
               --config p/default \
               --jobs 1 \
-              --max-memory 2048 \
+              --max-memory 768 \
               --exclude Admin/assets/vendors \
               --exclude fonts \
               --exclude scss/bootstrap \
@@ -68,6 +68,7 @@ jobs:
           SONAR_HOST_URL: http://localhost:9000
 
       - name: OWASP ZAP Baseline Scan
+        if: always()
         continue-on-error: true
         run: |
           docker run --rm --network host \
