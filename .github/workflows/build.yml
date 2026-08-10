@@ -5,6 +5,15 @@ on:
     branches:
       - main
   workflow_dispatch:
+    inputs:
+      mode:
+        description: Tracking mode to write to Confluence
+        required: true
+        type: choice
+        options:
+          - SCAN
+          - FIX
+        default: SCAN
 
 jobs:
   build:
@@ -88,6 +97,7 @@ jobs:
           SECURITY_TEST_ADMIN_EMAIL: ${{ secrets.SECURITY_TEST_ADMIN_EMAIL }}
           SECURITY_TEST_ADMIN_PASSWORD: ${{ secrets.SECURITY_TEST_ADMIN_PASSWORD }}
         run: python3 .github/security/manual_security_regression.py
+
       - name: Upload security reports
         if: always()
         uses: actions/upload-artifact@v4
@@ -95,46 +105,12 @@ jobs:
           name: security-reports
           path: security-reports/
 
-      - name: Verify Confluence tracking page access
+      - name: Update Confluence vulnerability tracking
         if: always()
         env:
           CONFLUENCE_BASE_URL: https://lukaazhun.atlassian.net
           CONFLUENCE_PAGE_ID: "65975"
           CONFLUENCE_EMAIL: ${{ secrets.CONFLUENCE_EMAIL }}
           CONFLUENCE_API_TOKEN: ${{ secrets.CONFLUENCE_API_TOKEN }}
-        run: |
-          python3 - <<'PY'
-          import base64
-          import json
-          import os
-          import urllib.error
-          import urllib.request
-
-          base_url = os.environ["CONFLUENCE_BASE_URL"].rstrip("/")
-          page_id = os.environ["CONFLUENCE_PAGE_ID"]
-          email = os.environ.get("CONFLUENCE_EMAIL", "")
-          token = os.environ.get("CONFLUENCE_API_TOKEN", "")
-
-          if not email or not token:
-              raise SystemExit("Confluence credentials are not available to this job")
-
-          credentials = base64.b64encode(f"{email}:{token}".encode()).decode()
-          request = urllib.request.Request(
-              f"{base_url}/wiki/rest/api/content/{page_id}?expand=version",
-              headers={
-                  "Accept": "application/json",
-                  "Authorization": f"Basic {credentials}",
-              },
-          )
-
-          try:
-              with urllib.request.urlopen(request, timeout=20) as response:
-                  page = json.load(response)
-          except urllib.error.HTTPError as error:
-              raise SystemExit(f"Confluence page check failed with HTTP {error.code}") from error
-          except urllib.error.URLError as error:
-              raise SystemExit(f"Confluence page check failed: {error.reason}") from error
-
-          version = page.get("version", {}).get("number", "unknown")
-          print(f"Confluence access verified for page {page_id}; current version {version}.")
-          PY
+          CONFLUENCE_MODE: ${{ inputs.mode || 'SCAN' }}
+        run: python3 .github/security/update_confluence_tracking.py
