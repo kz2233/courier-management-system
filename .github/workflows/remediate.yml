@@ -8,6 +8,11 @@ on:
         required: true
         type: string
         default: /home/ubuntu/Desktop/courier-management-system
+      deploy_local:
+        description: Replace the local courier-web container after verification
+        required: true
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -24,6 +29,8 @@ jobs:
       REMEDIATION_SOURCE_PATH: ${{ inputs.source_path }}
       REMEDIATION_HTTP_PORT: "18080"
       REMEDIATION_HTTPS_PORT: "18443"
+      REMEDIATION_LOCAL_HTTP_PORT: "8082"
+      REMEDIATION_LOCAL_HTTPS_PORT: "18443"
 
     steps:
       - name: Check out remediation automation
@@ -54,6 +61,7 @@ jobs:
             printf 'REMEDIATION_DB_CONTAINER=courier-remediation-db-%s\n' "$GITHUB_RUN_ID"
             printf 'REMEDIATION_WEB_CONTAINER=courier-remediation-web-%s\n' "$GITHUB_RUN_ID"
             printf 'REMEDIATION_IMAGE=courier-management-system:fixed-%s\n' "$GITHUB_RUN_ID"
+            printf 'REMEDIATION_LOCAL_BACKUP_CONTAINER=courier-web-vulnerable-backup-%s\n' "$GITHUB_RUN_ID"
           } >> "$GITHUB_ENV"
           mkdir -p security-reports
 
@@ -295,12 +303,114 @@ jobs:
           docker image inspect "$REMEDIATION_IMAGE" > security-reports/remediated-image.json
           set -e
 
-      - name: Upload remediation reports
+      - name: Stop isolated verification containers before local deployment
         if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: security-remediation-${{ github.run_id }}
-          path: security-reports/
+        shell: bash
+        run: |
+          set +e
+          docker rm --force "$REMEDIATION_WEB_CONTAINER" "$REMEDIATION_DB_CONTAINER"
+          docker network rm "$REMEDIATION_NETWORK"
+          set -e
+
+      - name: Deploy the verified fixed image to the local application ports
+        id: deploy_local
+        if: ${{ success() && inputs.deploy_local }}
+        continue-on-error: true
+        shell: bash
+        env:
+          SECURITY_TEST_ADMIN_EMAIL: ${{ secrets.SECURITY_TEST_ADMIN_EMAIL }}
+          SECURITY_TEST_ADMIN_PASSWORD: ${{ secrets.SECURITY_TEST_ADMIN_PASSWORD }}
+        run: |
+          set -u
+          local_report_dir="security-reports/local-deployment"
+          local_report="$local_report_dir/manual-security-regression.json"
+          mkdir -p "$local_report_dir"
+          deployment_error=""
+          old_container_present=0
+
+          app_network="$(docker inspect --format '{{range $name, $_ := .NetworkSettings.Networks}}{{println $name}}{{end}}' courier-db 2>/dev/null | head -n 1 | tr -d '\r')"
+          if [ -z "$app_network" ]; then
+            deployment_error="The existing courier-db container or its Docker network was not found."
+          fi
+
+          if [ -z "$deployment_error" ] && docker container inspect courier-web >/dev/null 2>&1; then
+            old_container_present=1
+            docker stop courier-web >/dev/null 2>&1 || true
+            if ! docker rename courier-web "$REMEDIATION_LOCAL_BACKUP_CONTAINER"; then
+              deployment_error="Could not preserve the existing courier-web container as $REMEDIATION_LOCAL_BACKUP_CONTAINER."
+            fi
+          fi
+
+          if [ -z "$deployment_error" ]; then
+            docker run --detach \
+              --name courier-web \
+              --restart unless-stopped \
+              --network "$app_network" \
+              --publish "$REMEDIATION_LOCAL_HTTP_PORT:80" \
+              --publish "$REMEDIATION_LOCAL_HTTPS_PORT:443" \
+              --env DB_HOST=courier-db \
+              --env DB_PORT=3306 \
+              --env DB_NAME=royal_express_db \
+              --env DB_USER=courier_user \
+              --env DB_PASSWORD=courier_password \
+              --env SESSION_COOKIE_SECURE=1 \
+              "$REMEDIATION_IMAGE" >/dev/null 2>&1 || deployment_error="Could not start the verified image as courier-web."
+          fi
+
+          if [ -z "$deployment_error" ]; then
+            ready=0
+            for attempt in $(seq 1 60); do
+              if curl --silent --show-error --fail --insecure "https://127.0.0.1:$REMEDIATION_LOCAL_HTTPS_PORT/" >/dev/null 2>&1; then
+                ready=1
+                break
+              fi
+              sleep 2
+            done
+            if [ "$ready" -ne 1 ]; then
+              deployment_error="The fixed local HTTPS deployment did not become ready."
+            fi
+          fi
+
+          if [ -z "$deployment_error" ]; then
+            http_headers="$(curl --silent --show-error --dump-header - --output /dev/null "http://127.0.0.1:$REMEDIATION_LOCAL_HTTP_PORT/")"
+            printf '%s\n' "$http_headers" > security-reports/local-deployment/http-headers.txt
+            if ! printf '%s\n' "$http_headers" | rg -qi "^location: https://127\\.0\\.0\\.1:$REMEDIATION_LOCAL_HTTPS_PORT/"; then
+              deployment_error="The local HTTP endpoint did not redirect to the local HTTPS endpoint."
+            fi
+          fi
+
+          if [ -n "$deployment_error" ]; then
+            echo "::error::$deployment_error"
+            docker rm --force courier-web >/dev/null 2>&1 || true
+            if [ "$old_container_present" -eq 1 ] && docker container inspect "$REMEDIATION_LOCAL_BACKUP_CONTAINER" >/dev/null 2>&1; then
+              docker rename "$REMEDIATION_LOCAL_BACKUP_CONTAINER" courier-web >/dev/null 2>&1 || true
+              docker start courier-web >/dev/null 2>&1 || true
+            fi
+            printf '{"target":"https://127.0.0.1:%s","checks":[],"findings":[],"errors":[{"type":"DeploymentError","message":"%s"}]}\n' \
+              "$REMEDIATION_LOCAL_HTTPS_PORT" "$deployment_error" > "$local_report"
+            exit 1
+          fi
+
+          set +e
+          SECURITY_BASE_URL="https://127.0.0.1:$REMEDIATION_LOCAL_HTTPS_PORT" \
+          SECURITY_TLS_INSECURE=1 \
+          SECURITY_REPORT_DIR="$local_report_dir" \
+            python3 .github/security/manual_security_regression.py
+          security_status=$?
+          set -e
+          cp "$local_report" security-reports/manual-security-regression.json
+          exit "$security_status"
+
+      - name: Use the local deployment report when deployment was requested
+        if: ${{ always() && inputs.deploy_local }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          local_report="security-reports/local-deployment/manual-security-regression.json"
+          if [ ! -s "$local_report" ]; then
+            printf '%s\n' '{"target":"https://127.0.0.1:18443","checks":[],"findings":[],"errors":[{"type":"DeploymentError","message":"The local deployment report was not produced."}]}' > "$local_report"
+          fi
+          cp "$local_report" security-reports/manual-security-regression.json
 
       - name: Update Confluence vulnerability tracking in FIX mode
         if: always()
@@ -337,6 +447,13 @@ jobs:
               raise SystemExit("automated remediation verification did not pass")
           print("All automated remediation checks passed")
           PY
+
+      - name: Upload remediation reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-remediation-${{ github.run_id }}
+          path: security-reports/
 
       - name: Remove the temporary remediation containers
         if: always()
