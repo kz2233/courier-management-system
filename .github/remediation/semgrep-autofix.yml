@@ -1,0 +1,81 @@
+rules:
+  - id: courier-login-employee-prepared-statement
+    languages: [php]
+    severity: ERROR
+    message: Use a prepared statement for the employee login lookup.
+    patterns:
+      - pattern-inside: |
+          function getLoginAdmin(...) { ... }
+      - pattern: |
+          $loginAdmin = $LOGIN_QUERY;
+          $countloginAdmin = mysqli_query($CON, $loginAdmin);
+          $counts_loginAdmin = mysqli_num_rows($countloginAdmin);
+    fix: |
+      $stmtLoginAdmin = mysqli_prepare($CON, "SELECT * FROM employee WHERE email = ? AND password = ?");
+      mysqli_stmt_bind_param($stmtLoginAdmin, "ss", $email, $password);
+      mysqli_stmt_execute($stmtLoginAdmin);
+      mysqli_stmt_store_result($stmtLoginAdmin);
+      $counts_loginAdmin = mysqli_stmt_num_rows($stmtLoginAdmin);
+
+  - id: courier-login-customer-prepared-statement
+    languages: [php]
+    severity: ERROR
+    message: Use a prepared statement for the customer login lookup.
+    patterns:
+      - pattern-inside: |
+          function getLoginAdmin(...) { ... }
+      - pattern: |
+          $loginCustomer = $LOGIN_QUERY;
+          $count_loginCustomer = mysqli_query($CON, $loginCustomer);
+          $counts_loginCustomer = mysqli_num_rows($count_loginCustomer);
+    fix: |
+      $stmtLoginCustomer = mysqli_prepare($CON, "SELECT * FROM customer WHERE email = ? AND password = ?");
+      mysqli_stmt_bind_param($stmtLoginCustomer, "ss", $email, $password);
+      mysqli_stmt_execute($stmtLoginCustomer);
+      mysqli_stmt_store_result($stmtLoginCustomer);
+      $counts_loginCustomer = mysqli_stmt_num_rows($stmtLoginCustomer);
+
+  - id: courier-session-bootstrap-api
+    languages: [php]
+    severity: ERROR
+    paths:
+      include: [/server/api.php]
+    message: Use the shared secure session bootstrap.
+    pattern: session_start();
+    fix: require_once __DIR__ . '/inc/session.php';
+
+  - id: courier-session-bootstrap-root-auth
+    languages: [php]
+    severity: ERROR
+    paths:
+      include: [/auth.php]
+    message: Use the shared secure session bootstrap.
+    pattern: session_start();
+    fix: require_once __DIR__ . '/server/inc/session.php';
+
+  - id: courier-session-bootstrap-admin
+    languages: [php]
+    severity: ERROR
+    paths:
+      include:
+        - /Admin/checkAdmin.php
+        - /Admin/admin.php
+        - /Admin/logout.php
+    message: Use the shared secure session bootstrap.
+    pattern: session_start();
+    fix: require_once __DIR__ . '/../server/inc/session.php';
+
+  - id: courier-database-container-config
+    languages: [php]
+    severity: WARNING
+    paths:
+      include: [/server/inc/connection.php]
+    message: Read database connection settings from the deployment environment.
+    pattern: $CON = mysqli_connect($HOST, $USER, $PASSWORD, $DATABASE);
+    fix: |
+      $dbHost = getenv('DB_HOST') ?: 'localhost';
+      $dbUser = getenv('DB_USER') ?: 'root';
+      $dbPass = getenv('DB_PASSWORD') ?: '';
+      $dbName = getenv('DB_NAME') ?: 'royal_express_db';
+      $dbPort = (int) (getenv('DB_PORT') ?: 3306);
+      $CON = mysqli_connect($dbHost, $dbUser, $dbPass, $dbName, $dbPort) or die('Database Connection Fail');

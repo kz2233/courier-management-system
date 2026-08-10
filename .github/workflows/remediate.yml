@@ -1,0 +1,348 @@
+name: Automated security remediation
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_path:
+        description: Local application checkout to remediate
+        required: true
+        type: string
+        default: /home/ubuntu/Desktop/courier-management-system
+
+permissions:
+  contents: read
+
+concurrency:
+  group: courier-security-remediation
+  cancel-in-progress: false
+
+jobs:
+  remediate:
+    name: Apply and verify security fixes
+    runs-on: self-hosted
+    env:
+      REMEDIATION_SOURCE_PATH: ${{ inputs.source_path }}
+      REMEDIATION_HTTP_PORT: "18080"
+      REMEDIATION_HTTPS_PORT: "18443"
+
+    steps:
+      - name: Check out remediation automation
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve local application checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          app_dir="${REMEDIATION_SOURCE_PATH:-}"
+          if [ -z "$app_dir" ]; then
+            app_dir="$GITHUB_WORKSPACE"
+          fi
+          if [ ! -f "$app_dir/server/api.php" ]; then
+            echo "::error::No courier application found at $app_dir"
+            exit 1
+          fi
+          if [ ! -f "$app_dir/Database/royal_express_db.sql" ]; then
+            echo "::error::Database seed not found at $app_dir/Database/royal_express_db.sql"
+            exit 1
+          fi
+          {
+            printf 'REMEDIATION_APP_DIR=%s\n' "$app_dir"
+            printf 'REMEDIATION_BUILD_CONTEXT=%s/courier-remediation-%s\n' "$RUNNER_TEMP" "$GITHUB_RUN_ID"
+            printf 'REMEDIATION_NETWORK=courier-remediation-%s\n' "$GITHUB_RUN_ID"
+            printf 'REMEDIATION_DB_CONTAINER=courier-remediation-db-%s\n' "$GITHUB_RUN_ID"
+            printf 'REMEDIATION_WEB_CONTAINER=courier-remediation-web-%s\n' "$GITHUB_RUN_ID"
+            printf 'REMEDIATION_IMAGE=courier-management-system:fixed-%s\n' "$GITHUB_RUN_ID"
+          } >> "$GITHUB_ENV"
+          mkdir -p security-reports
+
+      - name: Back up the local application before editing
+        shell: bash
+        run: |
+          set -euo pipefail
+          backup_paths=(
+            server/api.php
+            auth.php
+            server/inc/get.php
+            server/inc/connection.php
+            server/inc/session.php
+            Admin/checkAdmin.php
+            Admin/admin.php
+            Admin/logout.php
+          )
+          existing_paths=()
+          for path in "${backup_paths[@]}"; do
+            if [ -e "$REMEDIATION_APP_DIR/$path" ]; then
+              existing_paths+=("$path")
+            fi
+          done
+          tar \
+            -czf security-reports/remediation-before.tar.gz \
+            -C "$REMEDIATION_APP_DIR" "${existing_paths[@]}"
+
+      - name: Install Semgrep on the local runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.local/bin:$PATH"
+          if ! command -v semgrep >/dev/null 2>&1; then
+            python3 -m pip install --user --disable-pip-version-check semgrep
+          fi
+          semgrep --version
+          docker --version
+
+      - name: Apply Semgrep autofixes
+        shell: bash
+        run: |
+          set -euo pipefail
+          session_file="$REMEDIATION_APP_DIR/server/inc/session.php"
+          if [ -e "$session_file" ] && ! cmp -s .github/remediation/session-bootstrap.php "$session_file"; then
+            echo "::error::$session_file already exists and differs from the remediation bootstrap; refusing to overwrite it"
+            exit 1
+          fi
+          if [ ! -e "$session_file" ]; then
+            install -m 0644 .github/remediation/session-bootstrap.php "$session_file"
+          fi
+          semgrep \
+            --config .github/remediation/semgrep-autofix.yml \
+            --autofix \
+            --metrics=off \
+            --json \
+            --output security-reports/semgrep-remediation.json \
+            --exclude Admin/assets/vendors \
+            --exclude fonts \
+            --exclude scss/bootstrap \
+            "$REMEDIATION_APP_DIR"
+
+      - name: Install Rector in an isolated Composer container
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            -v "$GITHUB_WORKSPACE/.github/remediation:/app" \
+            -w /app \
+            composer:2 \
+            install --no-interaction --no-progress --prefer-dist
+
+      - name: Apply Rector session AST refactoring
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            -v "$GITHUB_WORKSPACE:/workspace" \
+            -v "$REMEDIATION_APP_DIR:/target" \
+            -w /workspace/.github/remediation \
+            --entrypoint php \
+            composer:2 \
+            vendor/bin/rector process /target/server/inc/get.php \
+            --config=/workspace/.github/remediation/rector.php \
+            --no-progress-bar
+
+      - name: Prepare the isolated fixed-image build context
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$REMEDIATION_BUILD_CONTEXT"
+          rsync -a \
+            --exclude='.git' \
+            --exclude='.scannerwork' \
+            --exclude='security-reports' \
+            "$REMEDIATION_APP_DIR/" "$REMEDIATION_BUILD_CONTEXT/"
+
+      - name: Use Ansible to apply HTTPS and web-server hardening
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            --env "REMEDIATION_HTTPS_PORT=$REMEDIATION_HTTPS_PORT" \
+            --env "REMEDIATION_UID=$(id -u)" \
+            --env "REMEDIATION_GID=$(id -g)" \
+            -v "$GITHUB_WORKSPACE:/workspace:ro" \
+            -v "$REMEDIATION_BUILD_CONTEXT:/build-context" \
+            -w /workspace \
+            python:3.12-slim \
+            sh -ceu '
+              apt-get update
+              apt-get install --yes --no-install-recommends openssl
+              python -m pip install --no-cache-dir --disable-pip-version-check "ansible-core>=2.19,<2.20"
+              ansible-playbook \
+                -i localhost, \
+                --connection=local \
+                .github/remediation/ansible/remediate.yml \
+                -e "remediation_context=/build-context" \
+                -e "redirect_host=127.0.0.1" \
+                -e "https_port=$REMEDIATION_HTTPS_PORT" \
+                -e "server_name=127.0.0.1" \
+                -e "remediation_uid=$REMEDIATION_UID" \
+                -e "remediation_gid=$REMEDIATION_GID"
+            '
+
+      - name: Build the fixed HTTPS image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build \
+            --file "$GITHUB_WORKSPACE/.github/remediation/Dockerfile" \
+            --tag "$REMEDIATION_IMAGE" \
+            "$REMEDIATION_BUILD_CONTEXT"
+
+      - name: Start an isolated database for remediation verification
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker network create "$REMEDIATION_NETWORK"
+          docker run --detach \
+            --name "$REMEDIATION_DB_CONTAINER" \
+            --network "$REMEDIATION_NETWORK" \
+            --health-cmd='mariadb-admin ping -h 127.0.0.1 -uroot -proot_password' \
+            --health-interval=5s \
+            --health-timeout=3s \
+            --health-retries=30 \
+            --env MYSQL_ROOT_PASSWORD=root_password \
+            --env MYSQL_DATABASE=royal_express_db \
+            --env MYSQL_USER=courier_user \
+            --env MYSQL_PASSWORD=courier_password \
+            --volume "$REMEDIATION_BUILD_CONTEXT/Database/royal_express_db.sql:/docker-entrypoint-initdb.d/royal_express_db.sql:ro" \
+            mariadb:10.4
+
+          for attempt in $(seq 1 60); do
+            health="$(docker inspect --format '{{.State.Health.Status}}' "$REMEDIATION_DB_CONTAINER")"
+            if [ "$health" = healthy ]; then
+              break
+            fi
+            if [ "$attempt" = 60 ]; then
+              echo "::error::Remediation database did not become healthy"
+              docker logs "$REMEDIATION_DB_CONTAINER" || true
+              exit 1
+            fi
+            sleep 2
+          done
+
+      - name: Start the fixed image over HTTP and HTTPS
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --detach \
+            --name "$REMEDIATION_WEB_CONTAINER" \
+            --network "$REMEDIATION_NETWORK" \
+            --publish "$REMEDIATION_HTTP_PORT:80" \
+            --publish "$REMEDIATION_HTTPS_PORT:443" \
+            --env DB_HOST="$REMEDIATION_DB_CONTAINER" \
+            --env DB_PORT=3306 \
+            --env DB_NAME=royal_express_db \
+            --env DB_USER=courier_user \
+            --env DB_PASSWORD=courier_password \
+            --env SESSION_COOKIE_SECURE=1 \
+            "$REMEDIATION_IMAGE"
+          for attempt in $(seq 1 60); do
+            if curl --insecure --silent --show-error --fail "https://127.0.0.1:$REMEDIATION_HTTPS_PORT/" >/dev/null; then
+              exit 0
+            fi
+            if [ "$attempt" = 60 ]; then
+              echo "::error::Fixed HTTPS container did not become ready"
+              docker logs "$REMEDIATION_WEB_CONTAINER" || true
+              exit 1
+            fi
+            sleep 2
+          done
+
+      - name: Verify HTTP redirects and HTTPS security headers
+        shell: bash
+        run: |
+          set -euo pipefail
+          headers="$(curl --silent --show-error --dump-header - --output /dev/null "http://127.0.0.1:$REMEDIATION_HTTP_PORT/")"
+          printf '%s\n' "$headers" > security-reports/remediation-http-headers.txt
+          printf '%s\n' "$headers" | rg -qi '^location: https://127\.0\.0\.1:'
+          https_headers="$(curl --insecure --silent --show-error --dump-header - --output /dev/null "https://127.0.0.1:$REMEDIATION_HTTPS_PORT/")"
+          printf '%s\n' "$https_headers" > security-reports/remediation-https-headers.txt
+          printf '%s\n' "$https_headers" | rg -qi '^strict-transport-security:'
+
+      - name: Run the existing manual security regression checks against the fixed image
+        if: always()
+        continue-on-error: true
+        env:
+          SECURITY_BASE_URL: https://127.0.0.1:18443
+          SECURITY_TLS_INSECURE: "1"
+          SECURITY_TEST_ADMIN_EMAIL: ${{ secrets.SECURITY_TEST_ADMIN_EMAIL }}
+          SECURITY_TEST_ADMIN_PASSWORD: ${{ secrets.SECURITY_TEST_ADMIN_PASSWORD }}
+        run: python3 .github/security/manual_security_regression.py
+
+      - name: Run OWASP ZAP against the fixed HTTPS image
+        if: always()
+        continue-on-error: true
+        run: |
+          docker run --rm --network host \
+            -v "${{ github.workspace }}/security-reports:/zap/wrk" \
+            zaproxy/zap-stable \
+            zap-baseline.py \
+            -t "https://127.0.0.1:${REMEDIATION_HTTPS_PORT}" \
+            -J remediation-zap.json \
+            -r remediation-zap.html \
+            -w remediation-zap.md
+
+      - name: Collect the remediation diff and container logs
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          git -C "$REMEDIATION_APP_DIR" diff --binary > security-reports/remediation.patch
+          git -C "$REMEDIATION_APP_DIR" diff --stat > security-reports/remediation-diff-stat.txt
+          docker logs "$REMEDIATION_WEB_CONTAINER" > security-reports/remediation-web.log 2>&1
+          docker logs "$REMEDIATION_DB_CONTAINER" > security-reports/remediation-db.log 2>&1
+          docker image inspect "$REMEDIATION_IMAGE" > security-reports/remediated-image.json
+          set -e
+
+      - name: Upload remediation reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-remediation-${{ github.run_id }}
+          path: security-reports/
+
+      - name: Update Confluence vulnerability tracking in FIX mode
+        if: always()
+        env:
+          CONFLUENCE_BASE_URL: https://lukaazhun.atlassian.net
+          CONFLUENCE_PAGE_ID: "65975"
+          CONFLUENCE_EMAIL: ${{ secrets.CONFLUENCE_EMAIL }}
+          CONFLUENCE_API_TOKEN: ${{ secrets.CONFLUENCE_API_TOKEN }}
+          CONFLUENCE_MODE: FIX
+        run: python3 .github/security/update_confluence_tracking.py
+
+      - name: Fail if the fixed image still has manual findings
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          report_path = Path("security-reports/manual-security-regression.json")
+          if not report_path.is_file():
+              raise SystemExit("manual security regression report is missing")
+          report = json.loads(report_path.read_text(encoding="utf-8"))
+          findings = report.get("findings") or []
+          errors = report.get("errors") or []
+          skipped = [
+              check.get("name")
+              for check in report.get("checks", [])
+              if check.get("status") in {"skipped", "inconclusive"}
+          ]
+          if errors or findings or skipped:
+              print(json.dumps({"findings": findings, "errors": errors, "skipped_or_inconclusive": skipped}, indent=2))
+              raise SystemExit("automated remediation verification did not pass")
+          print("All automated remediation checks passed")
+          PY
+
+      - name: Remove the temporary remediation containers
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          docker rm --force "$REMEDIATION_WEB_CONTAINER" "$REMEDIATION_DB_CONTAINER"
+          docker network rm "$REMEDIATION_NETWORK"
+          set -e

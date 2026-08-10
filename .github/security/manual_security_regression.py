@@ -12,13 +12,14 @@ from __future__ import annotations
 import json
 import os
 import re
+import ssl
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urljoin, urlparse
-from urllib.request import HTTPRedirectHandler, Request, build_opener
+from urllib.request import HTTPSHandler, HTTPRedirectHandler, Request, build_opener
 
 
 BASE_URL = os.environ.get("SECURITY_BASE_URL", "http://127.0.0.1:8082").rstrip("/")
@@ -35,7 +36,15 @@ class NoRedirect(HTTPRedirectHandler):
         return None
 
 
-OPENER = build_opener(NoRedirect())
+if os.environ.get("SECURITY_TLS_INSECURE") == "1":
+    # The remediation workflow uses a short-lived self-signed certificate on
+    # localhost. Never enable this for a non-local target.
+    OPENER = build_opener(
+        NoRedirect(),
+        HTTPSHandler(context=ssl._create_unverified_context()),
+    )
+else:
+    OPENER = build_opener(NoRedirect())
 
 
 def add_check(name: str, status: str, details: str) -> None:

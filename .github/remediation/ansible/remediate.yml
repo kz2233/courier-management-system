@@ -1,0 +1,67 @@
+---
+- name: Prepare local HTTPS remediation build
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    remediation_output_dir: "{{ remediation_context | default('/tmp/courier-remediation-context') }}"
+    redirect_host: "{{ redirect_host | default('127.0.0.1') }}"
+    https_port: "{{ https_port | default('18443') }}"
+    server_name: "{{ server_name | default('127.0.0.1') }}"
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+  tasks:
+    - name: Create remediation configuration directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ remediation_output_dir }}/docker/remediation/apache"
+        - "{{ remediation_output_dir }}/docker/remediation/certs"
+
+    - name: Generate a short-lived certificate for the local fixed container
+      ansible.builtin.command:
+        argv:
+          - openssl
+          - req
+          - -x509
+          - -nodes
+          - -newkey
+          - rsa:2048
+          - -days
+          - "7"
+          - -keyout
+          - "{{ remediation_output_dir }}/docker/remediation/certs/server.key"
+          - -out
+          - "{{ remediation_output_dir }}/docker/remediation/certs/server.crt"
+          - -subj
+          - "/CN={{ server_name }}"
+          - -addext
+          - "subjectAltName=DNS:{{ server_name }},IP:127.0.0.1"
+      args:
+        creates: "{{ remediation_output_dir }}/docker/remediation/certs/server.crt"
+
+    - name: Restrict the local private key
+      ansible.builtin.file:
+        path: "{{ remediation_output_dir }}/docker/remediation/certs/server.key"
+        owner: "{{ remediation_uid | default(omit) }}"
+        group: "{{ remediation_gid | default(omit) }}"
+        mode: "0600"
+
+    - name: Render HTTP redirect configuration
+      ansible.builtin.template:
+        src: http-vhost.conf.j2
+        dest: "{{ remediation_output_dir }}/docker/remediation/apache/000-default.conf"
+        mode: "0644"
+
+    - name: Render HTTPS virtual host configuration
+      ansible.builtin.template:
+        src: https-vhost.conf.j2
+        dest: "{{ remediation_output_dir }}/docker/remediation/apache/default-ssl.conf"
+        mode: "0644"
+
+    - name: Render hardened PHP runtime settings
+      ansible.builtin.template:
+        src: php.ini.j2
+        dest: "{{ remediation_output_dir }}/docker/remediation/php.ini"
+        mode: "0644"
