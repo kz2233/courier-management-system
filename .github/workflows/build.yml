@@ -14,11 +14,18 @@ on:
           - SCAN
           - FIX
         default: SCAN
+      target_url:
+        description: Local application URL to scan
+        required: true
+        type: string
+        default: http://127.0.0.1:8082
 
 jobs:
   build:
     name: Build and analyze
     runs-on: self-hosted
+    env:
+      SCAN_TARGET_URL: ${{ inputs.target_url || 'http://127.0.0.1:8082' }}
 
     steps:
       - uses: actions/checkout@v4
@@ -84,7 +91,7 @@ jobs:
             -v "${{ github.workspace }}/security-reports:/zap/wrk" \
             zaproxy/zap-stable \
             zap-baseline.py \
-            -t http://127.0.0.1:8082 \
+            -t "$SCAN_TARGET_URL" \
             -J zap-baseline.json \
             -r zap-baseline.html \
             -w zap-baseline.md
@@ -93,7 +100,8 @@ jobs:
         if: always()
         continue-on-error: true
         env:
-          SECURITY_BASE_URL: http://127.0.0.1:8082
+          SECURITY_BASE_URL: ${{ inputs.target_url || 'http://127.0.0.1:8082' }}
+          SECURITY_TLS_INSECURE: "1"
           SECURITY_TEST_ADMIN_EMAIL: ${{ secrets.SECURITY_TEST_ADMIN_EMAIL }}
           SECURITY_TEST_ADMIN_PASSWORD: ${{ secrets.SECURITY_TEST_ADMIN_PASSWORD }}
         run: python3 .github/security/manual_security_regression.py

@@ -25,6 +25,20 @@ The verification service uses host ports `18080` and `18443`, a separate
 Docker network, and a fresh MariaDB instance. The temporary certificate is
 self-signed and is only for localhost testing.
 
+By default, after verification succeeds, the workflow replaces the local
+`courier-web` container with the fixed image. The local HTTP endpoint remains
+`http://127.0.0.1:8082` and redirects to
+`https://127.0.0.1:18443`. The previous container is retained as a stopped
+`courier-web-vulnerable-backup-<run-id>` container for rollback. The fixed
+deployment remains running after the workflow so it can be inspected manually
+or scanned.
+
+To scan the fixed deployment, manually run **Build** with this target URL:
+
+```text
+https://127.0.0.1:18443
+```
+
 Set the disposable local admin credentials in the repository secrets
 `SECURITY_TEST_ADMIN_EMAIL` and `SECURITY_TEST_ADMIN_PASSWORD`. Without them,
 logout/session-replay verification is skipped, so the workflow will not claim
